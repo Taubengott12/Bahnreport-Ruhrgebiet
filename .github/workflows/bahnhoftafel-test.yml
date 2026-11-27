@@ -110,7 +110,8 @@ jobs:
                   "/archive/search",
                   {
                       "date": datum,
-                      "station": "8000098",
+                                            **({"network": "VRR"} if linie == "S3"
+                         else {"station": "8000086"}),
                       "traffic": "regional",
                       "line": linie,
                       "min_delay": 6,
