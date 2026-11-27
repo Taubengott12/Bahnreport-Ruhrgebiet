@@ -1,6 +1,8 @@
 name: Bahnreport Ruhrgebiet
 
 on:
+  schedule:
+    - cron: '5 4 * * *'
   workflow_dispatch:
     inputs:
       datum:
