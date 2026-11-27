@@ -101,6 +101,32 @@ jobs:
                           if daten:
                               print("Beispielfahrt:", daten[0])
 
+          print("\n=== ROHDATEN-DIAGNOSE ===")
+
+          for key in [
+              "s3-hattingen-ruhr-mitte-0433",
+              "re1-koeln-hbf-0349",
+              "re6-dortmund-hbf-0507",
+              "ICE_1028"
+          ]:
+              lauf = abruf(
+                  "/trains/" + quote(key, safe="")
+                  + "/runs/2026-11-25"
+              )
+
+              print("\nZug:", key)
+
+              if not isinstance(lauf, dict):
+                  print("Keine auswertbare Antwort")
+                  continue
+
+              print("Datenfelder:", list(lauf.keys()))
+              print("Datenquelle:", lauf.get("source"))
+              print("Halte:", len(lauf.get("stops") or []))
+
+              for halt in lauf.get("stops") or []:
+                  print(halt)
+
           gruende = Counter()
 
           for linie in ["S3", "RE1", "S1", "RE6"]:
