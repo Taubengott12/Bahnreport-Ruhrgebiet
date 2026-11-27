@@ -1,0 +1,160 @@
+name: Bahnhoftafel API Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      datum:
+        description: 'Datum (JJJJ-MM-TT)'
+        required: false
+        default: '2026-11-25'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  api-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Bibliotheken installieren
+        run: pip install requests
+
+      - name: Bahnhoftafel API testen
+        env:
+          BAHNHOFTAFEL_TOKEN: ${{ secrets.BAHNHOFTAFEL_TOKEN }}
+          REPORT_DATE: ${{ inputs.datum }}
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          import requests
+          from urllib.parse import quote
+          from collections import Counter
+
+          token = os.environ["BAHNHOFTAFEL_TOKEN"]
+          datum = os.environ["REPORT_DATE"]
+          base = "https://developer.bahnhoftafel.de/v1"
+
+          if not token:
+              raise SystemExit("API-Token fehlt.")
+
+          session = requests.Session()
+          session.headers.update({
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/json"
+          })
+
+          def abruf(pfad, params=None):
+              time.sleep(2.2)
+              r = session.get(
+                  base + pfad,
+                  params=params,
+                  timeout=30
+              )
+              print(pfad, "HTTP", r.status_code)
+
+              if r.status_code in (401, 403, 429):
+                  raise SystemExit(
+                      f"API-Zugriff gestoppt: {r.status_code}"
+                  )
+
+              if r.status_code != 200:
+                  return None
+
+              return r.json()
+
+          print("Quelle: bahnhoftafel.de")
+          print("https://developer.bahnhoftafel.de/docs/datenquellen.html")
+          print("Testdatum:", datum)
+
+          print("\n=== ARCHIVSTATUS ===")
+          archiv = abruf("/archive")
+          if archiv:
+              print(archiv)
+
+          gruende = Counter()
+
+          for linie in ["S3", "RE1", "S1", "RE6"]:
+              print("\n=== LINIE", linie, "===")
+
+              fahrten = abruf(
+                  "/archive/search",
+                  {
+                      "date": datum,
+                      "station": "8000098",
+                      "traffic": "regional",
+                      "line": linie,
+                      "min_delay": 6,
+                      "limit": 500
+                  }
+              )
+
+              if not isinstance(fahrten, list):
+                  print("Keine auswertbare Fahrtenliste")
+                  continue
+
+              print("Verspaetete Fahrten gefunden:", len(fahrten))
+
+              gesehen = set()
+              getestet = 0
+              mit_gruenden = 0
+
+              for fahrt in fahrten:
+                  zug = fahrt.get("train", {})
+                  key = zug.get("key")
+
+                  if not key or key in gesehen:
+                      continue
+
+                  gesehen.add(key)
+                  if getestet >= 5:
+                      break
+
+                  getestet += 1
+                  print("\nZug:", key)
+
+                  lauf = abruf(
+                      "/trains/"
+                      + quote(key, safe="")
+                      + "/runs/"
+                      + datum
+                  )
+
+                  if not lauf:
+                      continue
+
+                  zuggruende = set()
+
+                  for halt in lauf.get("stops", []):
+                      station = halt.get("station") or {}
+                      for grund in halt.get("reasons") or []:
+                          art = grund.get("type") or grund.get("kind")
+                          code = grund.get("code")
+                          text = grund.get("text", "")
+
+                          print(
+                              station.get("name"),
+                              "| Code:", code,
+                              "| Art:", art,
+                              "| Grund:", text
+                          )
+
+                          if art == "delay":
+                              zuggruende.add((code, text))
+
+                  if zuggruende:
+                      mit_gruenden += 1
+                      gruende.update(zuggruende)
+
+              print("Getestete Fahrten:", getestet)
+              print("Fahrten mit Verspaetungsgrund:", mit_gruenden)
+
+          print("\n=== URSACHEN DER STICHPROBE ===")
+
+          for (code, text), anzahl in gruende.most_common():
+              print(code, "|", text, "| Fahrten:", anzahl)
+
+          print("\nAPI-Test abgeschlossen.")
+          PY
