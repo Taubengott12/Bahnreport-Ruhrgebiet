@@ -1,35 +1,43 @@
-name: Bahnreport API Test
+name: Bahnreport Ruhrgebiet
 
 on:
   workflow_dispatch:
+    inputs:
+      datum:
+        description: 'Datum (JJJJ-MM-TT), leer = gestern'
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  auswertung:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - name: Python Bibliotheken installieren
+      - name: Bibliotheken installieren
         run: pip install pandas pyarrow requests
 
-      - name: Bahndaten abrufen und pruefen
+      - name: Bahnreport erstellen
         env:
           TRAIN_ARCHIVE_TOKEN: ${{ secrets.TRAIN_ARCHIVE_TOKEN }}
+          REPORT_DATE: ${{ inputs.datum }}
         run: |
           python - <<'PY'
           import os
+          import io
+          import re
           import requests
           import pandas as pd
-          import io
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
 
-          datum = "2026-11-25"
-          token = os.environ["TRAIN_ARCHIVE_TOKEN"]
-
-          if not token:
-              raise SystemExit("API-Token fehlt.")
+          datum = os.environ.get("REPORT_DATE") or (
+              datetime.now(ZoneInfo("Europe/Berlin"))
+              - timedelta(days=1)
+          ).strftime("%Y-%m-%d")
 
           url = (
               "https://data.train-archive.eu/daily/"
@@ -39,37 +47,306 @@ jobs:
 
           response = requests.get(
               url,
-              headers={"X-Api-Key": token},
+              headers={
+                  "X-Api-Key": os.environ["TRAIN_ARCHIVE_TOKEN"]
+              },
               timeout=180
           )
-
-          print("HTTP-Status:", response.status_code)
           response.raise_for_status()
 
           df = pd.read_parquet(io.BytesIO(response.content))
+          df = df[
+              df["service_date"].astype(str).str[:10] == datum
+          ].copy()
 
-          print("DATENABRUF ERFOLGREICH")
-          print("Datum:", datum)
-          print("Datensaetze:", len(df))
-          print("Spalten:", df.columns.tolist())
+          if df.empty:
+              raise SystemExit("Keine Daten fuer dieses Datum.")
 
-          region = df[df["stop_name"].str.contains(
-              "Hattingen|Dahlhausen|Essen|Duisburg|"
-              "Bochum|Dortmund|Oberhausen|Mülheim",
-              case=False, na=False
-          )]
+          def norm(value):
+              return re.sub(
+                  r"[^a-z0-9äöü]",
+                  "",
+                  str(value).lower()
+              )
 
-          print("Regionale Datensaetze:", len(region))
+          stationen = {
+              "Hattingen Mitte": [
+                  "Hattingen Mitte",
+                  "Hattingen (Ruhr) Mitte"
+              ],
+              "Hattingen (Ruhr)": ["Hattingen (Ruhr)"],
+              "Bochum-Dahlhausen": ["Bochum-Dahlhausen"],
+              "Essen-Steele Ost": ["Essen-Steele Ost"],
+              "Essen-Steele": ["Essen-Steele"],
+              "Essen Hbf": ["Essen Hbf"],
+              "Bochum Hbf": ["Bochum Hbf"],
+              "Duisburg Hbf": ["Duisburg Hbf"],
+              "Dortmund Hbf": ["Dortmund Hbf"],
+              "Oberhausen Hbf": ["Oberhausen Hbf"],
+              "Mülheim (Ruhr) Hbf": [
+                  "Mülheim (Ruhr) Hbf",
+                  "Mülheim Hbf"
+              ]
+          }
 
-          print("Linien:")
-          print(region["route"].value_counts().head(40))
+          lookup = {
+              norm(alias): name
+              for name, aliases in stationen.items()
+              for alias in aliases
+          }
 
-          for column in ["trip_status", "stop_status",
-                         "stop_relationship", "delay_source"]:
-              if column in region.columns:
-                  print(column)
-                  print(region[column].value_counts(dropna=False))
+          df["station"] = df["stop_name"].map(norm).map(lookup)
 
-          print("Beispieldaten:")
-          print(region.head(10).to_string(index=False))
+          df["linie"] = (
+              df["route"].fillna("")
+              .str.upper().str.replace(" ", "", regex=False)
+          )
+
+          keys = [
+              "provider", "feed_id", "service_date",
+              "trip_id", "trip_start_time"
+          ]
+
+          df["fahrt"] = (
+              df[keys].fillna("").astype(str).agg("|".join, axis=1)
+          )
+
+          df["ausfall_halt"] = (
+              df["stop_status"].fillna("").str.lower().eq("skipped")
+          )
+
+          df["vollausfall"] = (
+              df["trip_status"].fillna("").str.lower()
+              .isin(["cancelled", "canceled"])
+              | df.groupby("fahrt")["ausfall_halt"].transform("all")
+          )
+
+          df["ausfall"] = df["ausfall_halt"] | df["vollausfall"]
+
+          df["teilausfall"] = (
+              df.groupby("fahrt")["ausfall_halt"].transform("any")
+              & ~df["vollausfall"]
+          )
+
+          df["delay"] = pd.to_numeric(
+              df["arrival_delay_min"], errors="coerce"
+          ).fillna(pd.to_numeric(
+              df["departure_delay_min"], errors="coerce"
+          ))
+
+          df["gueltig"] = (
+              ~df["ausfall"]
+              & df["delay"].between(-60, 720)
+              & df["delay_source"].eq("feed")
+          )
+
+          region = df[df["station"].notna()].copy()
+
+          region["verkehr"] = "Sonstige"
+          region.loc[
+              region["linie"].str.match(r"^(RE|RB|S)\d"),
+              "verkehr"
+          ] = "Nahverkehr"
+          region.loc[
+              region["linie"].str.match(r"^(ICE|IC|EC|ECE|RJ|FLX|NJ)"),
+              "verkehr"
+          ] = "Fernverkehr"
+
+          report = [
+              f"# Bahnreport Ruhrgebiet – {datum}",
+              "",
+              f"Rohdaten des Betriebstages: {len(df)}",
+              f"Regionale Haltdatensaetze: {len(region)}",
+              "",
+              "## Regionale Statistik",
+              "",
+              "| Verkehr | Halte | Verspaetungswerte | "
+              "Unter 1 Min. | Unter 6 Min. | Ausfaelle | "
+              "Mittlere Verspaetung |",
+              "|---|---:|---:|---:|---:|---:|---:|"
+          ]
+
+          def statistik(name, g):
+              d = g.loc[g["gueltig"], "delay"]
+              p1 = f"{100*d.lt(1).mean():.1f}%" if len(d) else "-"
+              p6 = f"{100*d.lt(6).mean():.1f}%" if len(d) else "-"
+              avg = f"{d.clip(lower=0).mean():.1f} Min." if len(d) else "-"
+              return (
+                  f"| {name} | {len(g)} | {len(d)} | "
+                  f"{p1} | {p6} | {g['ausfall'].sum()} | {avg} |"
+              )
+
+          for verkehr in ["Nahverkehr", "Fernverkehr"]:
+              report.append(statistik(
+                  verkehr, region[region["verkehr"] == verkehr]
+              ))
+
+          report += [
+              "",
+              "## Linienstatistik",
+              "",
+              "| Linie | Halte | Verspaetungswerte | Unter 1 Min. | "
+              "Unter 6 Min. | Ausfaelle | Mittlere Verspaetung |",
+              "|---|---:|---:|---:|---:|---:|---:|"
+          ]
+
+          for linie, g in region.groupby("linie"):
+              report.append(statistik(linie, g))
+
+          report += [
+              "",
+              "## Direkte Pendlerverbindungen",
+              "",
+              "| Strecke | Linie | Fahrten im Archiv | "
+              "Vollausfall | Einstieg/Ziel entfallen* | "
+              "Unbekannt** | Ziel unter 1 Min. | Ziel unter 6 Min. |",
+              "|---|---|---:|---:|---:|---:|---:|---:|"
+          ]
+
+          verbindungen = []
+
+          for start, ziel in [
+              ("Hattingen Mitte", "Essen Hbf"),
+              ("Essen Hbf", "Hattingen Mitte"),
+              ("Essen Hbf", "Duisburg Hbf"),
+              ("Duisburg Hbf", "Essen Hbf")
+          ]:
+              teil = region[
+                  region["station"].isin([start, ziel])
+                  & region["verkehr"].eq("Nahverkehr")
+              ]
+
+              for fahrt, g in teil.groupby("fahrt"):
+                  a = g[g["station"].eq(start)].sort_values("stop_sequence")
+                  b = g[g["station"].eq(ziel)].sort_values("stop_sequence")
+
+                  if a.empty or b.empty:
+                      continue
+
+                  a = a.iloc[0]
+                  b = b.iloc[-1]
+
+                  if not a["stop_sequence"] < b["stop_sequence"]:
+                      continue
+
+                  if "Hattingen" in start + ziel and a["linie"] != "S3":
+                      continue
+
+                  voll = bool(a["vollausfall"])
+                  entfallen = not voll and bool(a["ausfall"] or b["ausfall"])
+
+                  nutzbar = not voll and not entfallen
+                  bekannt = nutzbar and bool(a["gueltig"] and b["gueltig"])
+
+                  verbindungen.append({
+                      "strecke": f"{start} - {ziel}",
+                      "linie": a["linie"],
+                      "vollausfall": voll,
+                      "entfallen": entfallen,
+                      "unbekannt": nutzbar and not bekannt,
+                      "delay": b["delay"] if bekannt else float("nan")
+                  })
+
+          if verbindungen:
+              for (strecke, linie), g in pd.DataFrame(
+                  verbindungen
+              ).groupby(["strecke", "linie"]):
+                  d = g["delay"].dropna()
+                  p1 = f"{100*d.lt(1).mean():.1f}%" if len(d) else "-"
+                  p6 = f"{100*d.lt(6).mean():.1f}%" if len(d) else "-"
+                  report.append(
+                      f"| {strecke} | {linie} | {len(g)} | "
+                      f"{g['vollausfall'].sum()} | "
+                      f"{g['entfallen'].sum()} | "
+                      f"{g['unbekannt'].sum()} | {p1} | {p6} |"
+                  )
+
+          report += [
+              "",
+              "* Fahrt nicht vollstaendig ausgefallen, "
+              "aber Einstieg oder Zielhalt entfallen.",
+              "** Keine ausreichenden direkten Verspaetungswerte.",
+              "",
+              "## S3 – ausgefallene Halte nach Bahnhof",
+              "",
+              "| Bahnhof | Ausgefallene Halte | Davon Teilausfall |",
+              "|---|---:|---:|"
+          ]
+
+          for station, g in region[
+              region["linie"].eq("S3")
+          ].groupby("station"):
+              teil = (g["ausfall"] & ~g["vollausfall"]).sum()
+              report.append(
+                  f"| {station} | {g['ausfall'].sum()} | {teil} |"
+              )
+
+          report += [
+              "",
+              "## Verteilung der Verspaetungen",
+              ""
+          ]
+
+          d = region.loc[region["gueltig"], "delay"]
+
+          for name, mask in [
+              ("Unter 1 Minute", d.lt(1)),
+              ("1 bis unter 6 Minuten", d.ge(1) & d.lt(6)),
+              ("6 bis unter 15 Minuten", d.ge(6) & d.lt(15)),
+              ("15 bis unter 30 Minuten", d.ge(15) & d.lt(30)),
+              ("Ab 30 Minuten", d.ge(30))
+          ]:
+              report.append(f"- {name}: {mask.sum()}")
+
+          report += [
+              "",
+              "## Hoechste gemeldete Verspaetungen",
+              "",
+              "| Linie | Fahrt-ID | Bahnhof | Verspaetung |",
+              "|---|---|---|---:|"
+          ]
+
+          top = region[region["gueltig"]].sort_values(
+              "delay", ascending=False
+          ).drop_duplicates("fahrt").head(10)
+
+          for _, r in top.iterrows():
+              report.append(
+                  f"| {r['linie']} | {r['trip_id']} | "
+                  f"{r['station']} | {r['delay']:.1f} Min. |"
+              )
+
+          report += [
+              "",
+              "## Datenqualitaet",
+              "",
+              f"- Fortgeschriebene Werte: "
+              f"{region['delay_source'].eq('propagated').sum()}",
+              f"- Halte ohne auswertbaren direkten Verspaetungswert "
+              f"und ohne Ausfall: "
+              f"{(~region['gueltig'] & ~region['ausfall']).sum()}",
+              f"- Erfasste eindeutige regionale Fahrten: "
+              f"{region['fahrt'].nunique()}",
+              "- Nicht erfasste Sollfahrten noch nicht abgeglichen.",
+              "- Verspaetungsursachen nicht in diesen Rohdaten enthalten.",
+              "- Letzte gemeldete Werte, keine garantierten Ist-Zeiten.",
+              "- Auswertung nach Betriebstag.",
+              f"- Quelle: https://www.train-archive.eu/providers/de-gtfsde/{datum}"
+          ]
+
+          text = "\n".join(report)
+          print(text)
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(text + "\n")
+
+          with open("bahnreport.md", "w") as f:
+              f.write(text + "\n")
           PY
+
+      - name: Bericht speichern
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bahnreport
+          path: bahnreport.md
+          retention-days: 30
