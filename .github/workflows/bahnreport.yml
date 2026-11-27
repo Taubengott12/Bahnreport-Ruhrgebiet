@@ -1,0 +1,75 @@
+name: Bahnreport API Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Python Bibliotheken installieren
+        run: pip install pandas pyarrow requests
+
+      - name: Bahndaten abrufen und pruefen
+        env:
+          TRAIN_ARCHIVE_TOKEN: ${{ secrets.TRAIN_ARCHIVE_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+          import pandas as pd
+          import io
+
+          datum = "2026-11-25"
+          token = os.environ["TRAIN_ARCHIVE_TOKEN"]
+
+          if not token:
+              raise SystemExit("API-Token fehlt.")
+
+          url = (
+              "https://data.train-archive.eu/daily/"
+              "provider=de-gtfsde/service=TripUpdate/"
+              f"date={datum}.parquet"
+          )
+
+          response = requests.get(
+              url,
+              headers={"X-Api-Key": token},
+              timeout=180
+          )
+
+          print("HTTP-Status:", response.status_code)
+          response.raise_for_status()
+
+          df = pd.read_parquet(io.BytesIO(response.content))
+
+          print("DATENABRUF ERFOLGREICH")
+          print("Datum:", datum)
+          print("Datensaetze:", len(df))
+          print("Spalten:", df.columns.tolist())
+
+          region = df[df["stop_name"].str.contains(
+              "Hattingen|Dahlhausen|Essen|Duisburg|"
+              "Bochum|Dortmund|Oberhausen|Mülheim",
+              case=False, na=False
+          )]
+
+          print("Regionale Datensaetze:", len(region))
+
+          print("Linien:")
+          print(region["route"].value_counts().head(40))
+
+          for column in ["trip_status", "stop_status",
+                         "stop_relationship", "delay_source"]:
+              if column in region.columns:
+                  print(column)
+                  print(region[column].value_counts(dropna=False))
+
+          print("Beispieldaten:")
+          print(region.head(10).to_string(index=False))
+          PY
