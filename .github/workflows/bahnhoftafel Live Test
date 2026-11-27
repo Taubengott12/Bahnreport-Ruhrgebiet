@@ -1,0 +1,100 @@
+name: Bahnhoftafel Live Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Bibliotheken installieren
+        run: pip install requests
+
+      - name: IRIS Live-Daten testen
+        env:
+          BAHNHOFTAFEL_TOKEN: ${{ secrets.BAHNHOFTAFEL_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+          import time
+          from collections import Counter
+
+          base = "https://developer.bahnhoftafel.de/v1"
+          headers = {
+              "Authorization": "Bearer " + os.environ["BAHNHOFTAFEL_TOKEN"]
+          }
+
+          stationen = {
+              "Hattingen Mitte": "8002640",
+              "Essen-Steele Ost": "8001913",
+              "Essen Hbf": "8000098",
+              "Duisburg Hbf": "8000086",
+              "Bochum Hbf": "8000041",
+              "Oberhausen Hbf": "8000286"
+          }
+
+          for name, eva in stationen.items():
+              print("\n===", name, "===")
+
+              for richtung in ["departures", "arrivals"]:
+                  time.sleep(2)
+
+                  r = requests.get(
+                      f"{base}/stations/{eva}/{richtung}",
+                      headers=headers,
+                      params={
+                          "source": "iris",
+                          "products": "regional,suburban",
+                          "from": -30,
+                          "duration": 120
+                      },
+                      timeout=30
+                  )
+
+                  print(richtung, "HTTP", r.status_code)
+
+                  if r.status_code in (401, 403, 429):
+                      raise SystemExit("API-Zugriff gestoppt")
+
+                  if r.status_code != 200:
+                      continue
+
+                  daten = r.json()
+                  print("Datenquelle:", daten.get("source"))
+                  fahrten = daten.get(richtung, [])
+                  linien = Counter()
+                  anzahl = 0
+
+                  for f in fahrten:
+                      zug = f.get("train") or {}
+                      linie = zug.get("line") or zug.get("name")
+                      linien[linie] += 1
+
+                      gruende = f.get("reasons") or []
+                      if not gruende:
+                          continue
+
+                      anzahl += 1
+                      print({
+                          "id": f.get("id"),
+                          "trip_id": f.get("trip_id"),
+                          "zug": zug,
+                          "arrival": f.get("arrival"),
+                          "departure": f.get("departure"),
+                          "verspaetung": f.get("delay"),
+                          "ausfall": f.get("cancelled"),
+                          "gruende": gruende
+                      })
+
+                  print("Linien:", dict(linien))
+                  print("Fahrten:", len(fahrten))
+                  print("Fahrten mit Gruenden:", anzahl)
+
+          print("\nLive-Test abgeschlossen.")
+          PY
