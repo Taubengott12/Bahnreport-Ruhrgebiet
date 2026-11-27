@@ -74,6 +74,33 @@ jobs:
           if archiv:
               print(archiv)
 
+          print("\n=== ERWEITERTE ARCHIVSUCHE ===")
+
+          for tag in [datum, "2026-11-26"]:
+              for bahnhof in ["8000098", "8000086"]:
+                  for verkehr in ["regional", "long_distance"]:
+                      daten = abruf("/archive/search", {
+                          "date": tag,
+                          "station": bahnhof,
+                          "traffic": verkehr,
+                          "limit": 500
+                      })
+
+                      if isinstance(daten, list):
+                          print(tag, bahnhof, verkehr)
+                          print("Gefundene Fahrten:", len(daten))
+
+                          linien = Counter(
+                              f.get("train", {}).get("line")
+                              or f.get("train", {}).get("category")
+                              for f in daten
+                          )
+
+                          print("Linien:", dict(linien))
+
+                          if daten:
+                              print("Beispielfahrt:", daten[0])
+
           gruende = Counter()
 
           for linie in ["S3", "RE1", "S1", "RE6"]:
